@@ -7,11 +7,21 @@
   const LOG_PREFIX = '[X Media DL]';
   const BTN_MARK = 'data-xmdl-injected';
 
+  // Tweet container selector covering both UIs:
+  // - legacy: <article data-testid="tweet">
+  // - new "x-web" client: <div role="link" data-href="/user/status/id"> wrapping <article>
+  const TWEET_CELL_SEL = 'article[data-testid="tweet"], [role="link"][data-href*="/status/"]';
+
   let enabled = true;
   let downloadFolder = 'XMediaDownloader';
 
   // tweetId -> array of raw media objects from GraphQL/API responses
   const tweetMediaCache = new Map();
+
+  // video id (amplify_video_thumb/ext_tw_video_thumb poster id) -> { mp4: [], m3u8: [] }
+  // captured from the player's own network requests by inject.js. Needed on the new
+  // x-web UI where <video src> is a blob: URL (MediaSource), so no direct URL exists in the DOM.
+  const videoUrlCache = new Map();
 
   // ---------- Storage / enable-disable ----------
 
@@ -67,9 +77,17 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || data.source !== 'xmediadl' || data.type !== 'media-data') return;
-    if (!data.tweetId || !Array.isArray(data.mediaList)) return;
-    tweetMediaCache.set(data.tweetId, data.mediaList);
+    if (!data || data.source !== 'xmediadl') return;
+    if (data.type === 'media-data' && data.tweetId && Array.isArray(data.mediaList)) {
+      tweetMediaCache.set(data.tweetId, data.mediaList);
+    } else if (data.type === 'video-url' && data.videoId && data.url) {
+      const entry = videoUrlCache.get(data.videoId) || { mp4: [], m3u8: [] };
+      const isHls = /\.m3u8(\?|#|$)/i.test(data.url);
+      const isSegment = /\/(seg|chunk|clip|frag|init)[^/]*\.(mp4|m4s|ts)(\?|#|$)/i.test(data.url);
+      const list = isHls ? entry.m3u8 : entry.mp4;
+      if (!isSegment && !list.includes(data.url)) list.push(data.url);
+      videoUrlCache.set(data.videoId, entry);
+    }
   });
 
   // ---------- Media URL helpers ----------
@@ -91,7 +109,8 @@
 
   function bestMp4Variant(videoInfo) {
     if (!videoInfo || !Array.isArray(videoInfo.variants)) return null;
-    const mp4s = videoInfo.variants.filter((v) => v.content_type === 'video/mp4');
+    const isMp4 = (v) => (v.content_type || v.contentType) === 'video/mp4' || /\.mp4(\?|$)/i.test(v.url || '');
+    const mp4s = videoInfo.variants.filter((v) => isMp4(v) && v.url);
     if (mp4s.length === 0) return null;
     mp4s.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
     return mp4s[0];
@@ -99,36 +118,70 @@
 
   function hasOnlyHls(videoInfo) {
     if (!videoInfo || !Array.isArray(videoInfo.variants)) return false;
-    const hasHls = videoInfo.variants.some((v) => v.content_type === 'application/x-mpegURL');
-    const hasMp4 = videoInfo.variants.some((v) => v.content_type === 'video/mp4');
+    const type = (v) => v.content_type || v.contentType || '';
+    const hasHls = videoInfo.variants.some((v) => type(v) === 'application/x-mpegURL' || type(v) === 'application/vnd.apple.mpegurl' || /\.m3u8(\?|$)/i.test(v.url || ''));
+    const hasMp4 = videoInfo.variants.some((v) => type(v) === 'video/mp4');
     return hasHls && !hasMp4;
   }
 
-  function extractTweetIdAndUser(article) {
-    const link = article.querySelector('a[href*="/status/"] time')?.closest('a');
-    if (!link) return null;
-    const match = link.getAttribute('href')?.match(/\/([^/]+)\/status\/(\d+)/);
-    if (!match) return null;
-    return { username: match[1], tweetId: match[2] };
+  // Video id -> best captured progressive MP4 URL (picked by the highest WxH in the path).
+  function bestCapturedMp4(videoId) {
+    const entry = videoUrlCache.get(videoId);
+    if (!entry || entry.mp4.length === 0) return null;
+    const res = (u) => { const m = u.match(/\/(\d+)x(\d+)\//); return m ? Number(m[1]) * Number(m[2]) : 0; };
+    return entry.mp4.slice().sort((a, b) => res(b) - res(a))[0];
   }
 
-  // Quote-tweets nest a second full tweet (with its own id/media) inside the outer tweet's
-  // article. Collect every "status permalink" reference in DOM order (outer tweet first,
-  // followed by any quoted tweet) so we can also look up the quoted tweet's cached media,
-  // which is keyed by its own tweet ID in tweetMediaCache (see inject.js's walkForMedia).
+  // Media field accessors tolerant of both legacy (media_url_https/video_info) and
+  // camelCase (mediaUrl/videoInfo) API shapes from the new x-web client.
+  const mediaTypeOf = (m) => m.type || m.media_type;
+  const mediaUrlOf = (m) => m.media_url_https || m.media_url || m.url || m.preview_image_url;
+  const videoInfoOf = (m) => m.video_info || m.videoInfo;
+
+  // Status permalink anchors owned by THIS article - i.e. not inside a nested
+  // repost/quote article, which belongs to a different tweet.
+  function ownedStatusLinks(article) {
+    return Array.from(article.querySelectorAll('a[href*="/status/"]'))
+      .filter((a) => a.closest('article') === article);
+  }
+
+  function extractTweetIdAndUser(article) {
+    const parse = (href) => href?.match(/\/([^/]+)\/status\/(\d+)/);
+    // New "x-web" UI: the tweet cell is a role=link whose data-href IS the permalink.
+    // Only trust it when this article is the cell's own (first) article - in reposts
+    // the closest() cell of a nested article is the outer tweet's cell.
+    const cell = article.closest?.('[role="link"][data-href*="/status/"]');
+    const m1 = cell && cell.querySelector('article') === article && parse(cell.getAttribute('data-href'));
+    if (m1) return { username: m1[1], tweetId: m1[2] };
+    // Legacy UI timestamp link (contains <time>), else the first owned status
+    // permalink - on the new UI that's the timestamp anchor ("17m"/"Nov 22").
+    const owned = ownedStatusLinks(article);
+    const link = owned.find((a) => a.querySelector('time')) || owned[0];
+    const m2 = link && parse(link.getAttribute('href'));
+    return m2 ? { username: m2[1], tweetId: m2[2] } : null;
+  }
+
+  // Quote-tweets/reposts nest a second tweet (with its own id/media) inside the outer
+  // tweet. Collect every "status permalink" reference (outer tweet first) so we can
+  // also look up the nested tweet's cached media, which is keyed by its own tweet ID
+  // in tweetMediaCache (see inject.js's walkForMedia). On the new UI this also picks up
+  // media-attribution links inside the player (videos embedded from another tweet).
   function extractAllTweetRefs(article) {
     const refs = [];
     const seen = new Set();
-    article.querySelectorAll('a[href*="/status/"] time').forEach((time) => {
-      const link = time.closest('a');
-      if (!link) return;
-      const match = link.getAttribute('href')?.match(/\/([^/]+)\/status\/(\d+)/);
-      if (!match) return;
-      const tweetId = match[2];
-      if (seen.has(tweetId)) return;
-      seen.add(tweetId);
-      refs.push({ username: match[1], tweetId });
-    });
+    const add = (href) => {
+      const m = href?.match(/\/([^/]+)\/status\/(\d+)/);
+      if (m && !seen.has(m[2])) { seen.add(m[2]); refs.push({ username: m[1], tweetId: m[2] }); }
+    };
+    // Own permalink first: the new-UI cell data-href (guarded by ownership as in
+    // extractTweetIdAndUser), then this article's owned status links (timestamp,
+    // quote-card permalinks), then nested x-web cells and player attribution links
+    // so embedded/quoted media keyed under other tweet IDs is also found.
+    const cell = article.closest?.('[role="link"][data-href*="/status/"]');
+    if (cell && cell.querySelector('article') === article) add(cell.getAttribute('data-href'));
+    ownedStatusLinks(article).forEach((a) => add(a.getAttribute('href')));
+    article.querySelectorAll('[role="link"][data-href*="/status/"]').forEach((d) => add(d.getAttribute('data-href')));
+    article.querySelectorAll('[data-press-control] a[href*="/status/"]').forEach((a) => add(a.getAttribute('href')));
     return refs;
   }
 
@@ -138,27 +191,30 @@
     const refs = extractAllTweetRefs(article);
     const refsToCheck = refs.length > 0 ? refs : [{ username, tweetId }];
 
+    const seenUrls = new Set();
     refsToCheck.forEach((ref) => {
       const cached = tweetMediaCache.get(ref.tweetId);
       if (!cached || cached.length === 0) return;
 
       cached.forEach((media, idx) => {
+        const type = mediaTypeOf(media);
         const suffix = cached.length > 1 ? `_${idx + 1}` : '';
-        if (media.type === 'photo') {
-          const url = upgradeImageUrl(media.media_url_https || media.media_url);
-          items.push({ url, filename: `${ref.username}_${ref.tweetId}${suffix}.jpg`, type: 'photo' });
-        } else if (media.type === 'video' || media.type === 'animated_gif') {
-          const best = bestMp4Variant(media.video_info);
-          if (best) {
-            items.push({ url: best.url, filename: `${ref.username}_${ref.tweetId}${suffix}.mp4`, type: media.type });
-          } else if (hasOnlyHls(media.video_info)) {
+        if (type === 'photo') {
+          const url = upgradeImageUrl(mediaUrlOf(media));
+          if (url && !seenUrls.has(url)) { seenUrls.add(url); items.push({ url, filename: `${ref.username}_${ref.tweetId}${suffix}.jpg`, type: 'photo' }); }
+        } else if (type === 'video' || type === 'animated_gif') {
+          const best = bestMp4Variant(videoInfoOf(media));
+          if (best && !seenUrls.has(best.url)) {
+            seenUrls.add(best.url);
+            items.push({ url: best.url, filename: `${ref.username}_${ref.tweetId}${suffix}.mp4`, type });
+          } else if (!best && hasOnlyHls(videoInfoOf(media))) {
             console.error(
               LOG_PREFIX,
               `content.js: tweet ${ref.tweetId} media #${idx + 1} is HLS-only (.m3u8), no MP4 rendition found.`,
               'Reconstructing MP4 from HLS segments is not implemented - this is a known open technical challenge.',
-              media.video_info
+              videoInfoOf(media)
             );
-          } else {
+          } else if (!best) {
             console.error(LOG_PREFIX, `content.js: tweet ${ref.tweetId} media #${idx + 1} has no usable video_info`, media);
           }
         }
@@ -187,6 +243,21 @@
       items.push({ url: upgradeImageUrl(img.src), filename: `${username}_${tweetId}${suffix}.jpg`, type: 'photo' });
     });
 
+    // Videos on the new UI use a blob: src (MediaSource), but the poster URL carries
+    // the video id, which we can match against URLs captured from the player's own
+    // network requests (inject.js -> videoUrlCache).
+    article.querySelectorAll('video').forEach((vid) => {
+      const poster = vid.getAttribute('poster') || '';
+      const vidId = poster.match(/(?:amplify_video_thumb|ext_tw_video_thumb|tweet_video_thumb)\/(\d+)/)?.[1];
+      const mp4 = vidId && bestCapturedMp4(vidId);
+      if (mp4 && !seenUrls.has(mp4)) {
+        seenUrls.add(mp4);
+        items.push({ url: mp4, filename: `${username}_${tweetId}.mp4`, type: 'video' });
+      } else if (vidId && videoUrlCache.has(vidId)) {
+        console.error(LOG_PREFIX, `content.js: only HLS (.m3u8) streams captured for video ${vidId} in tweet ${tweetId}`);
+      }
+    });
+
     if (items.length === 0) {
       console.error(LOG_PREFIX, `content.js: could not find any downloadable media (image or video) for tweet ${tweetId}`);
     }
@@ -202,17 +273,15 @@
     </svg>`;
 
   function findActionBar(article) {
-    const replyBtn = article.querySelector('[data-testid="reply"]');
-    if (replyBtn) {
-      const group = replyBtn.closest('[role="group"]');
-      if (group) return group;
-    }
-    // Fallback: any role="group" inside the tweet that also contains a "like" button.
+    // The action bar is a role="group" containing engagement controls - legacy UI
+    // uses data-testid, the new x-web UI uses data-engagement-action. The group must
+    // be owned by THIS article: reposts nest the original tweet (with its own bar)
+    // inside the outer article, and we must not attach to that one.
+    const ENGAGEMENT = '[data-testid="reply"], [data-testid="like"], [data-testid="retweet"], [data-engagement-action="reply"], [data-engagement-action="like"], [data-engagement-action="retweet"]';
     const groups = article.querySelectorAll('[role="group"]');
     for (const g of groups) {
-      if (g.querySelector('[data-testid="like"]') || g.querySelector('[data-testid="retweet"]')) {
-        return g;
-      }
+      if (g.closest('article') !== article) continue;
+      if (g.querySelector(ENGAGEMENT)) return g;
     }
     return null;
   }
@@ -224,10 +293,13 @@
     if (article.querySelector('[data-testid="videoPlayer"]')) return true;
     if (article.querySelector('[data-testid="videoComponent"]')) return true;
     if (article.querySelector('[data-testid="swipe-to-dismiss"]')) return true;
-    // Fallbacks in case testids change.
-    if (article.querySelector('img[src*="pbs.twimg.com/media"]')) return true;
-    if (article.querySelector('img[src*="pbs.twimg.com"][src*="format="]')) return true;
+    // New x-web UI: media blocks are wrapped in [data-press-control]; videos carry a
+    // pbs.twimg.com poster image; photos render as pbs.twimg.com/media imgs.
+    if (article.querySelector('[data-press-control]')) return true;
     if (article.querySelector('video')) return true;
+    if (article.querySelector('img[src*="pbs.twimg.com/media"], img[src*="amplify_video_thumb"], img[src*="tweet_video_thumb"]')) return true;
+    // Fallbacks in case testids change.
+    if (article.querySelector('img[src*="pbs.twimg.com"][src*="format="]')) return true;
     return false;
   }
 
@@ -302,20 +374,28 @@
     }
   }
 
-  function injectButtonForTweet(article) {
+  function injectButtonForTweet(cell) {
     try {
-      if (article.getAttribute(BTN_MARK) === '1') return;
-      if (!tweetHasMedia(article)) return;
+      // Legacy cells ARE the tweet article. New-UI cells are wrappers that may hold
+      // several <article>s (reposts nest the original tweet inside a wrapper article).
+      const targets = cell.matches('article') ? [cell] : Array.from(cell.querySelectorAll('article'));
+      for (const article of targets) {
+        if (article.getAttribute(BTN_MARK) === '1') continue;
+        if (!tweetHasMedia(article)) continue;
 
-      const actionBar = findActionBar(article);
-      if (!actionBar) {
-        console.error(LOG_PREFIX, 'content.js: could not locate action bar for a media tweet, skipping button injection', article);
-        return;
+        const actionBar = findActionBar(article);
+        // A found action bar must belong to THIS article - for reposts the outer
+        // article only finds the nested tweet's group, which we must not use.
+        if (!actionBar || actionBar.closest('article') !== article) {
+          if (!actionBar) {
+            console.error(LOG_PREFIX, 'content.js: could not locate action bar for a media tweet, skipping button injection', article);
+          }
+          continue;
+        }
+
+        article.setAttribute(BTN_MARK, '1');
+        actionBar.appendChild(createButton(article));
       }
-
-      article.setAttribute(BTN_MARK, '1');
-      const btn = createButton(article);
-      actionBar.appendChild(btn);
     } catch (e) {
       console.error(LOG_PREFIX, 'content.js: failed to inject button for tweet', e);
     }
@@ -342,14 +422,19 @@
   }
 
   function findViewerMediaEl() {
-    const layers = document.getElementById('layers');
-    if (!layers) return null;
-    const swipe = layers.querySelector('[data-testid="swipe-to-dismiss"]');
-    if (swipe) {
-      const el = swipe.querySelector('img[src*="pbs.twimg.com"], video');
+    // The legacy UI renders the lightbox under #layers; the new x-web client parks
+    // open media under a dedicated [data-active-media-holder] container instead.
+    for (const root of [document.getElementById('layers'), document.querySelector('[data-active-media-holder]')]) {
+      if (!root) continue;
+      const swipe = root.querySelector('[data-testid="swipe-to-dismiss"]');
+      if (swipe) {
+        const el = swipe.querySelector('img[src*="pbs.twimg.com"], video');
+        if (el) return el;
+      }
+      const el = root.querySelector('img[src*="pbs.twimg.com/media"], img[src*="amplify_video_thumb"], video');
       if (el) return el;
     }
-    return layers.querySelector('img[src*="pbs.twimg.com/media"], video');
+    return null;
   }
 
   function getMediaForViewer(info, mediaEl) {
@@ -362,25 +447,27 @@
       let media = null;
       if (mediaEl && mediaEl.tagName === 'IMG') {
         const key = mediaKey(mediaEl.src);
-        media = cached.find((m) => mediaKey(m.media_url_https || m.media_url) === key) || null;
+        media = cached.find((m) => mediaKey(mediaUrlOf(m)) === key) || null;
       }
       if (!media) {
-        const typed = cached.filter((m) =>
-          info.kind === 'photo' ? m.type === 'photo' : m.type === 'video' || m.type === 'animated_gif'
-        );
+        const typed = cached.filter((m) => {
+          const t = mediaTypeOf(m);
+          return info.kind === 'photo' ? t === 'photo' : t === 'video' || t === 'animated_gif';
+        });
         media = typed[info.index] || cached[info.index] || typed[0] || cached[0];
       }
 
       if (media) {
         const suffix = cached.length > 1 ? `_${cached.indexOf(media) + 1}` : '';
-        if (media.type === 'photo') {
-          return [{ url: upgradeImageUrl(media.media_url_https || media.media_url), filename: `${info.username}_${info.tweetId}${suffix}.jpg`, type: 'photo' }];
+        const type = mediaTypeOf(media);
+        if (type === 'photo') {
+          return [{ url: upgradeImageUrl(mediaUrlOf(media)), filename: `${info.username}_${info.tweetId}${suffix}.jpg`, type: 'photo' }];
         }
-        const best = bestMp4Variant(media.video_info);
+        const best = bestMp4Variant(videoInfoOf(media));
         if (best) {
-          return [{ url: best.url, filename: `${info.username}_${info.tweetId}${suffix}.mp4`, type: media.type }];
+          return [{ url: best.url, filename: `${info.username}_${info.tweetId}${suffix}.mp4`, type }];
         }
-        console.error(LOG_PREFIX, `content.js: viewer media for tweet ${info.tweetId} has no MP4 variant (possibly HLS-only)`, media.video_info);
+        console.error(LOG_PREFIX, `content.js: viewer media for tweet ${info.tweetId} has no MP4 variant (possibly HLS-only)`, videoInfoOf(media));
         return [];
       }
     }
@@ -388,6 +475,17 @@
     // DOM fallback: download whatever image the viewer is showing.
     if (mediaEl && mediaEl.tagName === 'IMG') {
       return [{ url: upgradeImageUrl(mediaEl.src), filename: `${info.username}_${info.tweetId}_${info.index + 1}.jpg`, type: 'photo' }];
+    }
+
+    // New-UI video viewer: the <video> uses a blob: src, so resolve through the
+    // poster id against URLs captured from the player's own requests.
+    if (mediaEl && mediaEl.tagName === 'VIDEO') {
+      const vidId = (mediaEl.getAttribute('poster') || '').match(/(?:amplify_video_thumb|ext_tw_video_thumb|tweet_video_thumb)\/(\d+)/)?.[1];
+      const mp4 = vidId && bestCapturedMp4(vidId);
+      if (mp4) {
+        return [{ url: mp4, filename: `${info.username}_${info.tweetId}_${info.index + 1}.mp4`, type: 'video' }];
+      }
+      console.error(LOG_PREFIX, `content.js: no captured MP4 for viewer video (poster id ${vidId || 'unknown'}) in tweet ${info.tweetId}`);
     }
 
     console.error(LOG_PREFIX, `content.js: no media data available for viewer tweet ${info.tweetId}`);
@@ -453,14 +551,14 @@
   function scanForTweets(root) {
     try {
       const scope = root || document;
-      const articles = scope.querySelectorAll('article[data-testid="tweet"]');
+      const cells = scope.querySelectorAll(TWEET_CELL_SEL);
       let mediaCount = 0;
-      articles.forEach((article) => {
-        if (tweetHasMedia(article)) mediaCount += 1;
-        injectButtonForTweet(article);
+      cells.forEach((cell) => {
+        if (tweetHasMedia(cell)) mediaCount += 1;
+        injectButtonForTweet(cell);
       });
-      if (articles.length > 0) {
-        console.log(LOG_PREFIX, `content.js: scanned ${articles.length} tweet(s), ${mediaCount} with media, ${document.querySelectorAll('.xmdl-btn').length} button(s) in DOM`);
+      if (cells.length > 0) {
+        console.log(LOG_PREFIX, `content.js: scanned ${cells.length} tweet(s), ${mediaCount} with media, ${document.querySelectorAll('.xmdl-btn').length} button(s) in DOM`);
       }
     } catch (e) {
       console.error(LOG_PREFIX, 'content.js: error scanning for tweets', e);
@@ -474,7 +572,7 @@
       for (const mutation of mutations) {
         mutation.addedNodes.forEach((node) => {
           if (node.nodeType !== Node.ELEMENT_NODE) return;
-          if (node.matches && node.matches('article[data-testid="tweet"]')) {
+          if (node.matches && node.matches(TWEET_CELL_SEL)) {
             injectButtonForTweet(node);
           } else if (node.querySelectorAll) {
             scanForTweets(node);
