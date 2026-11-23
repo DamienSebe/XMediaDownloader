@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>X Media Downloader</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="xmdl-popup">
+    <header>
+      <h1>X Media Downloader</h1>
+    </header>
+
+    <div class="xmdl-row">
+      <label for="xmdl-enabled">Enable download buttons</label>
+      <label class="xmdl-switch">
+        <input type="checkbox" id="xmdl-enabled" />
+        <span class="xmdl-slider"></span>
+      </label>
+    </div>
+
+    <div class="xmdl-row xmdl-column">
+      <label for="xmdl-folder">Download subfolder (inside your Downloads folder)</label>
+      <input type="text" id="xmdl-folder" placeholder="XMediaDownloader" />
+    </div>
+
+    <button id="xmdl-save">Save</button>
+    <p id="xmdl-status" class="xmdl-status"></p>
+
+    <footer>
+      <small>Multi-image tweets: all images download in one click.</small>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

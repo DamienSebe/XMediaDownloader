@@ -1,0 +1,115 @@
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: #15202b;
+  color: #e7e9ea;
+}
+
+.xmdl-popup {
+  width: 280px;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+h1 {
+  font-size: 15px;
+  margin: 0 0 12px 0;
+}
+
+.xmdl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.xmdl-column {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+label {
+  font-size: 13px;
+}
+
+input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #38444d;
+  background: #192734;
+  color: #e7e9ea;
+  font-size: 13px;
+}
+
+.xmdl-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+}
+
+.xmdl-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.xmdl-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: #38444d;
+  border-radius: 20px;
+  transition: 0.2s;
+}
+
+.xmdl-slider::before {
+  content: "";
+  position: absolute;
+  height: 16px;
+  width: 16px;
+  left: 2px;
+  bottom: 2px;
+  background-color: white;
+  border-radius: 50%;
+  transition: 0.2s;
+}
+
+.xmdl-switch input:checked + .xmdl-slider {
+  background-color: rgb(29, 155, 240);
+}
+
+.xmdl-switch input:checked + .xmdl-slider::before {
+  transform: translateX(16px);
+}
+
+#xmdl-save {
+  width: 100%;
+  padding: 8px;
+  border: none;
+  border-radius: 9999px;
+  background: rgb(29, 155, 240);
+  color: white;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#xmdl-save:hover {
+  background: rgb(26, 140, 216);
+}
+
+.xmdl-status {
+  min-height: 14px;
+  font-size: 12px;
+  color: rgb(0, 186, 124);
+  margin: 8px 0 0 0;
+}
+
+footer {
+  margin-top: 10px;
+  color: #8b98a5;
+}

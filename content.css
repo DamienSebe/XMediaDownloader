@@ -1,0 +1,84 @@
+/* [X Media DL] content.css
+   Styling for the injected download button. Uses currentColor + rgba overlays so it
+   automatically matches both X's light and dark themes without any theme detection. */
+
+.xmdl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 4px;
+  cursor: pointer;
+  color: rgb(113, 118, 123);
+  user-select: none;
+}
+
+.xmdl-btn-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9999px;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.xmdl-btn:hover .xmdl-btn-inner,
+.xmdl-btn:focus .xmdl-btn-inner {
+  background-color: rgba(29, 155, 240, 0.1);
+  color: rgb(29, 155, 240);
+}
+
+.xmdl-btn.xmdl-working .xmdl-btn-inner {
+  color: rgb(29, 155, 240);
+  animation: xmdl-pulse 0.9s ease-in-out infinite;
+}
+
+.xmdl-btn.xmdl-done .xmdl-btn-inner {
+  color: rgb(0, 186, 124);
+  background-color: rgba(0, 186, 124, 0.1);
+}
+
+.xmdl-btn.xmdl-error .xmdl-btn-inner {
+  color: rgb(244, 33, 46);
+  background-color: rgba(244, 33, 46, 0.1);
+}
+
+@keyframes xmdl-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.4; }
+  100% { opacity: 1; }
+}
+
+/* Floating button for the media viewer modal (open /status/<id>/photo|video/<n>).
+   Fixed bottom-left so it overlays the image area; semi-transparent dark circle
+   keeps the icon readable over any image regardless of theme. */
+.xmdl-btn.xmdl-viewer {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 2147483000;
+  margin-left: 0;
+  color: rgb(255, 255, 255);
+}
+
+.xmdl-btn.xmdl-viewer .xmdl-btn-inner {
+  width: 44px;
+  height: 44px;
+  background-color: rgba(0, 0, 0, 0.7);
+}
+
+.xmdl-btn.xmdl-viewer:hover .xmdl-btn-inner,
+.xmdl-btn.xmdl-viewer:focus .xmdl-btn-inner {
+  background-color: rgb(29, 155, 240);
+  color: rgb(255, 255, 255);
+}
+
+.xmdl-btn.xmdl-viewer.xmdl-done .xmdl-btn-inner {
+  color: rgb(255, 255, 255);
+  background-color: rgb(0, 186, 124);
+}
+
+.xmdl-btn.xmdl-viewer.xmdl-error .xmdl-btn-inner {
+  color: rgb(255, 255, 255);
+  background-color: rgb(244, 33, 46);
+}
