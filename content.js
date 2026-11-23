@@ -83,9 +83,14 @@
     } else if (data.type === 'video-url' && data.videoId && data.url) {
       const entry = videoUrlCache.get(data.videoId) || { mp4: [], m3u8: [] };
       const isHls = /\.m3u8(\?|#|$)/i.test(data.url);
-      const isSegment = /\/(seg|chunk|clip|frag|init)[^/]*\.(mp4|m4s|ts)(\?|#|$)/i.test(data.url);
+      // Fragments are never standalone-playable: .ts/.m4s media segments and
+      // seg/chunk/init-style init segments. Note init segments can also hide
+      // behind plain ".mp4" names - background.js range-checks for those.
+      const isFrag =
+        /\.(ts|m4s|mp4s)(\?|#|$)/i.test(data.url) ||
+        /\/(seg|chunk|clip|frag|init)[^/]*\.(mp4|m4s|ts)(\?|#|$)/i.test(data.url);
       const list = isHls ? entry.m3u8 : entry.mp4;
-      if (!isSegment && !list.includes(data.url)) list.push(data.url);
+      if (!isHls && !isFrag && !list.includes(data.url)) list.push(data.url);
       videoUrlCache.set(data.videoId, entry);
     }
   });
@@ -124,12 +129,25 @@
     return hasHls && !hasMp4;
   }
 
-  // Video id -> best captured progressive MP4 URL (picked by the highest WxH in the path).
-  function bestCapturedMp4(videoId) {
+  // Video id -> all captured .mp4 URLs, highest WxH in path first.
+  function capturedMp4s(videoId) {
     const entry = videoUrlCache.get(videoId);
-    if (!entry || entry.mp4.length === 0) return null;
+    if (!entry) return [];
     const res = (u) => { const m = u.match(/\/(\d+)x(\d+)\//); return m ? Number(m[1]) * Number(m[2]) : 0; };
-    return entry.mp4.slice().sort((a, b) => res(b) - res(a))[0];
+    return entry.mp4.slice().sort((a, b) => res(b) - res(a));
+  }
+
+  function bestCapturedMp4(videoId) {
+    return capturedMp4s(videoId)[0] || null;
+  }
+
+  // All MP4 variant URLs from a video_info object, highest bitrate first.
+  function mp4VariantUrls(videoInfo) {
+    if (!videoInfo || !Array.isArray(videoInfo.variants)) return [];
+    return videoInfo.variants
+      .filter((v) => v.url && ((v.content_type || v.contentType) === 'video/mp4' || /\.mp4(\?|$)/i.test(v.url)))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))
+      .map((v) => v.url);
   }
 
   // Media field accessors tolerant of both legacy (media_url_https/video_info) and
@@ -203,18 +221,24 @@
           const url = upgradeImageUrl(mediaUrlOf(media));
           if (url && !seenUrls.has(url)) { seenUrls.add(url); items.push({ url, filename: `${ref.username}_${ref.tweetId}${suffix}.jpg`, type: 'photo' }); }
         } else if (type === 'video' || type === 'animated_gif') {
-          const best = bestMp4Variant(videoInfoOf(media));
-          if (best && !seenUrls.has(best.url)) {
-            seenUrls.add(best.url);
-            items.push({ url: best.url, filename: `${ref.username}_${ref.tweetId}${suffix}.mp4`, type });
-          } else if (!best && hasOnlyHls(videoInfoOf(media))) {
+          const candidates = mp4VariantUrls(videoInfoOf(media));
+          // Also try player-captured URLs for the same media id (the amplify_video
+          // path id equals the media id) in case the listed variants are DASH init
+          // segments that only LOOK like .mp4s.
+          capturedMp4s(media.id_str || media.id).forEach((u) => {
+            if (!candidates.includes(u)) candidates.push(u);
+          });
+          if (candidates.length > 0 && !seenUrls.has(candidates[0])) {
+            seenUrls.add(candidates[0]);
+            items.push({ url: candidates[0], candidates, filename: `${ref.username}_${ref.tweetId}${suffix}.mp4`, type });
+          } else if (candidates.length === 0 && hasOnlyHls(videoInfoOf(media))) {
             console.error(
               LOG_PREFIX,
               `content.js: tweet ${ref.tweetId} media #${idx + 1} is HLS-only (.m3u8), no MP4 rendition found.`,
               'Reconstructing MP4 from HLS segments is not implemented - this is a known open technical challenge.',
               videoInfoOf(media)
             );
-          } else if (!best) {
+          } else if (candidates.length === 0) {
             console.error(LOG_PREFIX, `content.js: tweet ${ref.tweetId} media #${idx + 1} has no usable video_info`, media);
           }
         }
@@ -249,10 +273,10 @@
     article.querySelectorAll('video').forEach((vid) => {
       const poster = vid.getAttribute('poster') || '';
       const vidId = poster.match(/(?:amplify_video_thumb|ext_tw_video_thumb|tweet_video_thumb)\/(\d+)/)?.[1];
-      const mp4 = vidId && bestCapturedMp4(vidId);
-      if (mp4 && !seenUrls.has(mp4)) {
-        seenUrls.add(mp4);
-        items.push({ url: mp4, filename: `${username}_${tweetId}.mp4`, type: 'video' });
+      const candidates = vidId ? capturedMp4s(vidId).filter((u) => !seenUrls.has(u)) : [];
+      if (candidates.length > 0) {
+        candidates.forEach((u) => seenUrls.add(u));
+        items.push({ url: candidates[0], candidates, filename: `${username}_${tweetId}.mp4`, type: 'video' });
       } else if (vidId && videoUrlCache.has(vidId)) {
         console.error(LOG_PREFIX, `content.js: only HLS (.m3u8) streams captured for video ${vidId} in tweet ${tweetId}`);
       }
@@ -463,9 +487,9 @@
         if (type === 'photo') {
           return [{ url: upgradeImageUrl(mediaUrlOf(media)), filename: `${info.username}_${info.tweetId}${suffix}.jpg`, type: 'photo' }];
         }
-        const best = bestMp4Variant(videoInfoOf(media));
-        if (best) {
-          return [{ url: best.url, filename: `${info.username}_${info.tweetId}${suffix}.mp4`, type }];
+        const candidates = mp4VariantUrls(videoInfoOf(media));
+        if (candidates.length > 0) {
+          return [{ url: candidates[0], candidates, filename: `${info.username}_${info.tweetId}${suffix}.mp4`, type }];
         }
         console.error(LOG_PREFIX, `content.js: viewer media for tweet ${info.tweetId} has no MP4 variant (possibly HLS-only)`, videoInfoOf(media));
         return [];
@@ -481,9 +505,9 @@
     // poster id against URLs captured from the player's own requests.
     if (mediaEl && mediaEl.tagName === 'VIDEO') {
       const vidId = (mediaEl.getAttribute('poster') || '').match(/(?:amplify_video_thumb|ext_tw_video_thumb|tweet_video_thumb)\/(\d+)/)?.[1];
-      const mp4 = vidId && bestCapturedMp4(vidId);
-      if (mp4) {
-        return [{ url: mp4, filename: `${info.username}_${info.tweetId}_${info.index + 1}.mp4`, type: 'video' }];
+      const candidates = vidId ? capturedMp4s(vidId) : [];
+      if (candidates.length > 0) {
+        return [{ url: candidates[0], candidates, filename: `${info.username}_${info.tweetId}_${info.index + 1}.mp4`, type: 'video' }];
       }
       console.error(LOG_PREFIX, `content.js: no captured MP4 for viewer video (poster id ${vidId || 'unknown'}) in tweet ${info.tweetId}`);
     }
