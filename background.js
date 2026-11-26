@@ -129,8 +129,33 @@ async function downloadOne(item, folder) {
   }
 }
 
+// Public embed/syndication endpoint - returns a tweet's mediaDetails (with real
+// video_info MP4 variants) without auth. Used by content.js as a fallback when
+// live API capture found nothing (new x-web client streams data via SSR/Flight
+// payloads the page hooks can't see). Fetched here because the service worker
+// bypasses the endpoint's restrictive CORS via host_permissions.
+async function fetchSyndicationMedia(tweetId) {
+  const res = await fetch(`https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=x`);
+  if (!res.ok) return null;
+  const json = await res.json();
+  const media = json.mediaDetails || json.media_details;
+  return Array.isArray(media) && media.length > 0 ? media : null;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.type !== 'xmdl-download') return false;
+  if (!message || !message.type) return false;
+
+  if (message.type === 'xmdl-syndication') {
+    fetchSyndicationMedia(message.tweetId)
+      .then((media) => sendResponse(media ? { ok: true, media } : { ok: false, error: 'no media' }))
+      .catch((e) => {
+        console.error(LOG_PREFIX, 'background.js: syndication fetch failed for', message.tweetId, e);
+        sendResponse({ ok: false, error: String(e) });
+      });
+    return true;
+  }
+
+  if (message.type !== 'xmdl-download') return false;
 
   const items = Array.isArray(message.items) ? message.items : [];
   const folder = message.folder;

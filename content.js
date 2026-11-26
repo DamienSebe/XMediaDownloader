@@ -354,6 +354,44 @@
     if (state === 'error') btn.classList.add('xmdl-error');
   }
 
+  // Last-resort media source: X's public embed/syndication endpoint returns full
+  // mediaDetails (incl. video_info MP4 variants) for any public tweet with no auth.
+  // Needed on the new x-web client, where tweet data may arrive via SSR/Flight
+  // payloads that inject.js's fetch/XHR hooks never see. Fetched via background.js
+  // because the endpoint's CORS only allows platform.twitter.com embeds.
+  function fetchSyndicationMedia(tweetId) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'xmdl-syndication', tweetId }, (res) => {
+          if (chrome.runtime.lastError) {
+            console.error(LOG_PREFIX, 'content.js: syndication request failed', chrome.runtime.lastError.message);
+            resolve(null);
+            return;
+          }
+          if (res && res.ok && Array.isArray(res.media) && res.media.length > 0) {
+            tweetMediaCache.set(tweetId, res.media);
+            resolve(res.media);
+          } else {
+            resolve(null);
+          }
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  // Populate tweetMediaCache via syndication for every ref we know about, skipping
+  // ids already captured from the live API traffic.
+  async function ensureMediaCache(tweetIds) {
+    await Promise.all(
+      tweetIds.map(async (id) => {
+        if (!id || tweetMediaCache.has(id)) return;
+        await fetchSyndicationMedia(id);
+      })
+    );
+  }
+
   function sendDownloadItems(items, btn) {
     chrome.runtime.sendMessage(
       { type: 'xmdl-download', items, folder: downloadFolder },
@@ -374,7 +412,7 @@
     );
   }
 
-  function handleDownloadClick(article, btn) {
+  async function handleDownloadClick(article, btn) {
     try {
       const ids = extractTweetIdAndUser(article);
       if (!ids) {
@@ -383,8 +421,17 @@
         return;
       }
       const { username, tweetId } = ids;
-      const items = getMediaForTweet(article, username, tweetId);
 
+      // If live capture never saw this tweet (new x-web client streams data via
+      // SSR/Flight payloads the page hooks can't see), pull syndication data
+      // first so real media variants take priority over captured player URLs.
+      if (!tweetMediaCache.has(tweetId)) {
+        setButtonState(btn, 'working');
+        const refIds = extractAllTweetRefs(article).map((r) => r.tweetId);
+        await ensureMediaCache([tweetId, ...refIds]);
+      }
+
+      const items = getMediaForTweet(article, username, tweetId);
       if (items.length === 0) {
         setButtonState(btn, 'error');
         return;
@@ -516,12 +563,16 @@
     return [];
   }
 
-  function handleViewerClick(btn) {
+  async function handleViewerClick(btn) {
     try {
       const info = getViewerInfo();
       if (!info) {
         setButtonState(btn, 'error');
         return;
+      }
+      if (!tweetMediaCache.has(info.tweetId)) {
+        setButtonState(btn, 'working');
+        await ensureMediaCache([info.tweetId]);
       }
       const items = getMediaForViewer(info, findViewerMediaEl());
       if (items.length === 0) {
